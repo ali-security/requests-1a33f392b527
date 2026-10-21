@@ -923,6 +923,108 @@ class TestRequests:
             # fail if we use our default trust bundle.
             requests.get(httpbin_secure('status', '200'))
 
+    def test_different_connection_pool_for_tls_settings(self, httpbin_secure):
+        s = requests.Session()
+        s.trust_env = False
+        r1 = s.get(httpbin_secure('get'), verify=False)
+        assert r1.status_code == 200
+        # The connection opened without certificate verification must not be
+        # reused by a later request that asks for verification.
+        with pytest.raises(SSLError):
+            s.get(httpbin_secure('get'))
+
+    def test_different_connection_pool_for_falsy_verify(self, httpbin_secure):
+        s = requests.Session()
+        s.trust_env = False
+        # Any falsy ``verify`` disables verification, not just ``False``.
+        s.verify = None
+        r1 = s.get(httpbin_secure('get'))
+        assert r1.status_code == 200
+        with pytest.raises(SSLError):
+            s.get(httpbin_secure('get'), verify=True)
+
+    def test_different_connection_pool_for_ca_bundle(self, httpbin_secure):
+        from pytest_httpbin import certs
+
+        s = requests.Session()
+        s.trust_env = False
+        r1 = s.get(httpbin_secure('get'), verify=certs.where())
+        assert r1.status_code == 200
+        # A connection trusted through a custom CA bundle must not be reused
+        # by a later request that relies on the default trust store.
+        with pytest.raises(SSLError):
+            s.get(httpbin_secure('get'))
+
+    def test_different_connection_pool_for_client_cert(self, httpbin_secure, tmpdir):
+        from pytest_httpbin import certs
+        import trustme
+
+        ca = trustme.CA()
+        client_cert = ca.issue_cert(u'client.example.org')
+        cert_path = str(tmpdir.join('client.pem'))
+        client_cert.private_key_and_cert_chain_pem.write_to_path(cert_path)
+
+        s = requests.Session()
+        s.trust_env = False
+        s.verify = certs.where()
+        r1 = s.get(httpbin_secure('get'), cert=cert_path)
+        assert r1.status_code == 200
+        r2 = s.get(httpbin_secure('get'))
+        assert r2.status_code == 200
+        # A request without a client certificate must not reuse a connection
+        # that was established while presenting a client certificate.
+        assert r2.raw._pool is not r1.raw._pool
+        assert r1.raw._pool.cert_file == cert_path
+        assert r2.raw._pool.cert_file is None
+
+    def test_get_connection_with_tls_context_keys_pools_on_tls_settings(self, tmpdir):
+        adapter = HTTPAdapter()
+        request = requests.Request('GET', 'https://example.com/').prepare()
+
+        def get_pool(verify, cert=None):
+            return adapter.get_connection_with_tls_context(
+                request, verify, cert=cert)
+
+        verified = get_pool(True)
+        assert verified.cert_reqs == 'CERT_REQUIRED'
+        assert get_pool(True) is verified
+
+        unverified = get_pool(False)
+        assert unverified is not verified
+        assert unverified.cert_reqs == 'CERT_NONE'
+        assert get_pool(False) is unverified
+        assert get_pool(None) is unverified
+        assert get_pool('') is unverified
+
+        ca_bundle = str(tmpdir.join('ca.pem'))
+        bundle_pool = get_pool(ca_bundle)
+        assert bundle_pool not in (verified, unverified)
+        assert bundle_pool.cert_reqs == 'CERT_REQUIRED'
+        assert bundle_pool.ca_certs == ca_bundle
+
+        ca_dir = str(tmpdir)
+        dir_pool = get_pool(ca_dir)
+        assert dir_pool not in (verified, unverified, bundle_pool)
+        assert dir_pool.ca_cert_dir == ca_dir
+
+        cert_file = str(tmpdir.join('client.crt'))
+        key_file = str(tmpdir.join('client.key'))
+        pair_pool = get_pool(True, cert=(cert_file, key_file))
+        assert pair_pool is not verified
+        assert pair_pool.cert_file == cert_file
+        assert pair_pool.key_file == key_file
+
+        single_pool = get_pool(True, cert=cert_file)
+        assert single_pool not in (verified, pair_pool)
+        assert single_pool.cert_file == cert_file
+        assert single_pool.key_file is None
+
+    def test_get_connection_is_deprecated(self):
+        adapter = HTTPAdapter()
+        with pytest.warns(DeprecationWarning):
+            conn = adapter.get_connection('https://example.com/')
+        assert conn.host == 'example.com'
+
     def test_urlencoded_get_query_multivalued_param(self, httpbin):
 
         r = requests.get(httpbin('get'), params={'test': ['foo', 'baz']})

@@ -10,6 +10,7 @@ and maintain connections.
 
 import os.path
 import socket
+import warnings
 
 from urllib3.poolmanager import PoolManager, proxy_from_url
 from urllib3.response import HTTPResponse
@@ -50,6 +51,46 @@ DEFAULT_POOLBLOCK = False
 DEFAULT_POOLSIZE = 10
 DEFAULT_RETRIES = 0
 DEFAULT_POOL_TIMEOUT = None
+
+
+def _urllib3_request_context(request, verify, client_cert):
+    """Build the urllib3 host parameters and the TLS-aware pool kwargs for
+    ``request``, so that requests with different TLS settings never share a
+    connection pool (and therefore never reuse each other's connections).
+
+    :rtype: (dict, dict)
+    """
+    host_params = {}
+    pool_kwargs = {}
+    parsed_request_url = parse_url(request.url)
+    scheme = parsed_request_url.scheme
+    if scheme:
+        scheme = scheme.lower()
+    port = parsed_request_url.port
+    cert_reqs = 'CERT_REQUIRED'
+    # Mirror cert_verify(): any falsy ``verify`` disables verification.
+    if not verify:
+        cert_reqs = 'CERT_NONE'
+    elif isinstance(verify, basestring):
+        if not os.path.isdir(verify):
+            pool_kwargs['ca_certs'] = verify
+        else:
+            pool_kwargs['ca_cert_dir'] = verify
+    pool_kwargs['cert_reqs'] = cert_reqs
+    if client_cert:
+        if not isinstance(client_cert, basestring):
+            pool_kwargs['cert_file'] = client_cert[0]
+            pool_kwargs['key_file'] = client_cert[1]
+        else:
+            # According to our docs, we allow users to specify just the client
+            # cert path
+            pool_kwargs['cert_file'] = client_cert
+    host_params = {
+        'scheme': scheme,
+        'host': parsed_request_url.host,
+        'port': port,
+    }
+    return host_params, pool_kwargs
 
 
 class BaseAdapter(object):
@@ -289,8 +330,48 @@ class HTTPAdapter(BaseAdapter):
 
         return response
 
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        """Returns a urllib3 connection for the given request and TLS settings.
+        This should not be called from user code, and is only exposed for use
+        when subclassing the :class:`HTTPAdapter <requests.adapters.HTTPAdapter>`.
+
+        :param request: The :class:`PreparedRequest <PreparedRequest>` object
+            to be sent over the connection.
+        :param verify: Either a boolean, in which case it controls whether
+            we verify the server's TLS certificate, or a string, in which case it
+            must be a path to a CA bundle to use.
+        :param proxies: (optional) The proxies dictionary to apply to the request.
+        :param cert: (optional) Any user-provided SSL certificate to be trusted.
+        :rtype: urllib3.ConnectionPool
+        """
+        proxy = select_proxy(request.url, proxies)
+        try:
+            host_params, pool_kwargs = _urllib3_request_context(request, verify, cert)
+        except ValueError as e:
+            raise InvalidURL(e, request=request)
+        if proxy:
+            proxy = prepend_scheme_if_needed(proxy, 'http')
+            proxy_url = parse_url(proxy)
+            if not proxy_url.host:
+                raise InvalidProxyURL("Please check proxy URL. It is malformed"
+                                      " and could be missing the host.")
+            proxy_manager = self.proxy_manager_for(proxy)
+            conn = proxy_manager.connection_from_host(
+                pool_kwargs=pool_kwargs, **host_params
+            )
+        else:
+            # Only scheme should be lower case
+            conn = self.poolmanager.connection_from_host(
+                pool_kwargs=pool_kwargs, **host_params
+            )
+
+        return conn
+
     def get_connection(self, url, proxies=None):
-        """Returns a urllib3 connection for the given URL. This should not be
+        """DEPRECATED: Users should move to `get_connection_with_tls_context`
+        for all subclasses of HTTPAdapter.
+
+        Returns a urllib3 connection for the given URL. This should not be
         called from user code, and is only exposed for use when subclassing the
         :class:`HTTPAdapter <requests.adapters.HTTPAdapter>`.
 
@@ -298,6 +379,15 @@ class HTTPAdapter(BaseAdapter):
         :param proxies: (optional) A Requests-style dictionary of proxies used on this request.
         :rtype: urllib3.ConnectionPool
         """
+        warnings.warn(
+            (
+                "`get_connection` has been deprecated in favor of "
+                "`get_connection_with_tls_context`. Custom HTTPAdapter subclasses "
+                "will need to migrate. Please see "
+                "https://github.com/psf/requests/pull/6710 for more details."
+            ),
+            DeprecationWarning,
+        )
         proxy = select_proxy(url, proxies)
 
         if proxy:
@@ -409,7 +499,9 @@ class HTTPAdapter(BaseAdapter):
         """
 
         try:
-            conn = self.get_connection(request.url, proxies)
+            conn = self.get_connection_with_tls_context(
+                request, verify, proxies=proxies, cert=cert
+            )
         except LocationValueError as e:
             raise InvalidURL(e, request=request)
 
