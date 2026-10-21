@@ -4,6 +4,7 @@ import os
 import copy
 import filecmp
 from io import BytesIO
+import tempfile
 import zipfile
 from collections import deque
 
@@ -284,6 +285,46 @@ class TestExtractZippedPaths:
         assert extracted_path != zipped_path
         assert os.path.exists(extracted_path)
         assert filecmp.cmp(extracted_path, __file__)
+
+    def test_zipped_paths_ignore_preexisting_temp_file(self, tmpdir, monkeypatch):
+        # a file planted at the predictable <tempdir>/<member name> location
+        # must never be returned in place of the archive member's content
+        tmp = tmpdir.mkdir('tmp')
+        monkeypatch.setattr(tempfile, 'tempdir', tmp.strpath)
+        zipped_py = tmpdir.join('test.zip')
+        with zipfile.ZipFile(zipped_py.strpath, 'w') as f:
+            f.writestr('cacert.pem', b'legitimate content')
+
+        planted_path = os.path.join(tmp.strpath, 'cacert.pem')
+        with open(planted_path, 'wb') as f:
+            f.write(b'malicious content')
+
+        zipped_path = os.path.join(zipped_py.strpath, 'cacert.pem')
+        extracted_path = extract_zipped_paths(zipped_path)
+
+        assert extracted_path != planted_path
+        assert extracted_path.endswith('.pem')
+        with open(extracted_path, 'rb') as f:
+            assert f.read() == b'legitimate content'
+        with open(planted_path, 'rb') as f:
+            assert f.read() == b'malicious content'
+
+    def test_zipped_paths_extracted_to_unique_files(self, tmpdir):
+        zipped_py = tmpdir.join('test.zip')
+        with zipfile.ZipFile(zipped_py.strpath, 'w') as f:
+            f.writestr('cacert.pem', b'legitimate content')
+
+        zipped_path = os.path.join(zipped_py.strpath, 'cacert.pem')
+        first = extract_zipped_paths(zipped_path)
+        second = extract_zipped_paths(zipped_path)
+        try:
+            assert first != second
+            for extracted_path in (first, second):
+                with open(extracted_path, 'rb') as f:
+                    assert f.read() == b'legitimate content'
+        finally:
+            for extracted_path in set((first, second)):
+                os.remove(extracted_path)
 
 
 class TestContentEncodingDetection:
