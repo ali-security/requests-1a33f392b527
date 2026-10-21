@@ -1,31 +1,114 @@
 name: Tests
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'pytest selector to run instead of the full suite'
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
       matrix:
         python-version: [2.7, 3.6, 3.7, 3.8, 3.9]
-        os: [ubuntu-18.04, macOS-latest, windows-latest]
+        os: [ubuntu-22.04, macOS-latest, windows-latest]
+        exclude:
+          # macOS-latest is arm64: no prebuilt 2.7/3.6/3.7 exists for it and the
+          # from-source fallback needs Homebrew openssl@1.1 (formula removed).
+          # These legs move to the x64 macos-15-intel runner below.
+          - python-version: 2.7
+            os: macOS-latest
+          - python-version: 3.6
+            os: macOS-latest
+          - python-version: 3.7
+            os: macOS-latest
         include:
           # pypy3 on Mac OS currently fails trying to compile
           # brotlipy. Moving pypy3 to only test linux.
-          - python-version: pypy3
-            os: ubuntu-latest
+          - python-version: pypy-3.7
+            os: ubuntu-22.04
+          - python-version: 2.7
+            os: macos-15-intel
+            pythonorg: 2.7.18
+          - python-version: 3.6
+            os: macos-15-intel
+            pythonorg: 3.6.8
+          - python-version: 3.7
+            os: macos-15-intel
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
+      if: ${{ !matrix.pythonorg && !startsWith(matrix.python-version, 'pypy') }}
+      uses: MatteoH2O1999/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
+        allow-build: allow
+        cache-build: true
+    - name: Set up Python ${{ matrix.python-version }} (PyPy)
+      if: ${{ startsWith(matrix.python-version, 'pypy') }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Set up Python ${{ matrix.python-version }} (python.org installer)
+      if: ${{ matrix.pythonorg }}
       run: |
+        set -euxo pipefail
+        curl -sSfLo /tmp/python.pkg "https://www.python.org/ftp/python/${{ matrix.pythonorg }}/python-${{ matrix.pythonorg }}-macosx10.9.pkg"
+        sudo installer -pkg /tmp/python.pkg -target /
+        FW="/Library/Frameworks/Python.framework/Versions/${{ matrix.python-version }}/bin"
+        "$FW/python${{ matrix.python-version }}" -m ensurepip --upgrade
+        mkdir -p "$HOME/pybin"
+        ln -sf "$FW/python${{ matrix.python-version }}" "$HOME/pybin/python"
+        ln -sf "$FW/pip${{ matrix.python-version }}" "$HOME/pybin/pip"
+        echo "$FW" >> "$GITHUB_PATH"
+        echo "$HOME/pybin" >> "$GITHUB_PATH"
+    - name: Ensure make is available
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        if (-not (Get-Command make -ErrorAction SilentlyContinue)) { choco install make -y --no-progress }
+    - name: Build sdist and wheel
+      if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.9'
+      env:
+        PIP_INDEX_URL: https://:2021-07-13T14%3A55%3A06.933494Z@time-machines-pypi.sealsecurity.io/
+      run: |
+        python -m pip install build==0.5.1 setuptools==54.2.0 wheel==0.36.2
+        python -m build --no-isolation
+    - name: Upload sdist and wheel
+      if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.9'
+      uses: actions/upload-artifact@v4
+      with:
+        name: dist
+        path: dist/*
+        if-no-files-found: error
+    - name: Install dependencies
+      env:
+        PIP_INDEX_URL: https://:2021-07-13T14%3A55%3A06.933494Z@time-machines-pypi.sealsecurity.io/
+      run: |
+        python --version
+        # Release-era pip/setuptools: pip >= 25.1 requires the PEP 660
+        # build_editable hook that era setuptools lacks (breaks `pip install -e`),
+        # and setuptools >= 71 vendors a typeguard pytest plugin that pytest 3.x
+        # rejects at startup. --upgrade also lifts the python.org 3.6.8 pkg's
+        # pip 18.1, whose pre-resolver installs Werkzeug 2.0 against Flask 1.1.4.
+        python -m pip install --upgrade "pip<21.2" "setuptools<58"
+        # atomicwrites (needed by pytest >= 3.6) is absent from the time machine
+        # for this date; without it pip backtracks to pytest 3.5.1, which lacks
+        # the tmp_path_factory fixture tests/conftest.py uses.
+        python -m pip install --index-url https://pypi.org/simple/ atomicwrites==1.4.1
         make
     - name: Run tests
+      shell: bash
       run: |
-        make ci
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          pytest tests --junitxml=report.xml ${{ inputs.test-filter }}
+        else
+          make ci
+        fi
